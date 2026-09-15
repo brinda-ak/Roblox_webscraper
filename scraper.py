@@ -1,5 +1,3 @@
-"""Search Roblox's public catalog and print basic marketplace metadata."""
-
 import requests
 
 from database import DATABASE_PATH, store_items
@@ -10,68 +8,111 @@ REQUEST_TIMEOUT_SECONDS = 15
 
 
 def _json_response(response):
-    """Return a JSON response or raise an error that includes useful context."""
+    """Return JSON or raise an error with useful context."""
     try:
         response.raise_for_status()
         return response.json()
+
     except requests.exceptions.JSONDecodeError as exc:
         content_type = response.headers.get("content-type", "unknown")
         preview = response.text[:200].replace("\n", " ")
+
         raise RuntimeError(
-            f"Expected JSON but received {content_type}. Response starts: {preview!r}"
+            f"Expected JSON but received {content_type}. "
+            f"Response starts: {preview!r}"
         ) from exc
 
 
 def search_roblox_directory(keyword, category_id=11, limit=10):
-    """Search Roblox's catalog and return metadata for up to ``limit`` items.
+    """Search Roblox catalog, ordered by all-time sales."""
 
-    The Marketplace details endpoint includes names, prices, and creator data in
-    its search response, avoiding a separate request for every result.
-    """
-    params = {"keyword": keyword, "category": category_id, "limit": limit}
-    headers = {"User-Agent": "RobloxCatalogDataCollector/1.0"}
+    params = {
+        "keyword": keyword,
+        "category": category_id,
+        "limit": limit,
 
-    print(f"Searching the Roblox catalog for: {keyword!r}...")
+        # SORT BY SALES
+        "sortType": 2,
+
+        # ALL-TIME SALES
+        "sortAggregation": 5,
+    }
+
+    headers = {
+        "User-Agent": "RobloxCatalogDataCollector/1.0"
+    }
+
+    print(f"Searching Roblox for {keyword!r} by popularity (sales)...")
 
     try:
         with requests.Session() as session:
-            session.headers.update(headers)
-            search_response = session.get(
-                CATALOG_SEARCH_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS
-            )
-            search_payload = _json_response(search_response)
 
-            search_results = search_payload.get("data", [])
-            if not search_results:
-                print("No items found matching that keyword.")
+            session.headers.update(headers)
+
+            response = session.get(
+                CATALOG_SEARCH_URL,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS
+            )
+
+            payload = _json_response(response)
+
+            items = payload.get("data", [])
+
+            if not items:
+                print("No items found.")
                 return []
 
-            items = search_results
-
     except requests.RequestException as exc:
-        print(f"Network/API error while contacting Roblox: {exc}")
+        print(f"Network/API error: {exc}")
         return []
+
     except RuntimeError as exc:
         print(f"Unexpected Roblox API response: {exc}")
         return []
 
+    # Roblox already returned these in sales order
     stored_count = store_items(items)
+
     print(f"Saved {stored_count} items to {DATABASE_PATH.name}.")
 
-    print(f"\nFound {len(items)} results:\n" + "=" * 40)
-    for item in items:
-        price = item.get("price")
-        price_text = f"{price} Robux" if price is not None else "Offsale/Free"
+    print(
+        f"\nFound {len(items)} results "
+        f"(most popular by all-time sales first):\n"
+        + "=" * 55
+    )
 
-        print(f"🎁 {item.get('name', 'Unknown')}")
+    for rank, item in enumerate(items, start=1):
+
+        price = item.get("price")
+
+        if price is None:
+            price_text = item.get("priceStatus", "Offsale/Free")
+        else:
+            price_text = f"{price} Robux"
+
+        # Roblox may or may not include the actual count
+        sales = item.get("purchaseCount")
+
+        print(f"#{rank} 🎁 {item.get('name', 'Unknown')}")
+
         print(
-            f"   ID: {item.get('id')} | Price: {price_text} | "
+            f"   ID: {item.get('id')} | "
+            f"Price: {price_text} | "
             f"Creator: {item.get('creatorName', 'Unknown')}"
         )
-        print("-" * 40)
+
+        if sales is not None:
+            print(f"   Sales: {sales:,}")
+
+        print("-" * 55)
 
     return items
 
 
 if __name__ == "__main__":
-    search_roblox_directory(keyword="Sword")
+    search_roblox_directory(
+        keyword="Sword",
+        category_id=11,
+        limit=10
+    )
