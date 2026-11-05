@@ -28,17 +28,28 @@ def choose(options, supplied, prompt, optional=False):
 
 
 def read_marketplace_labels(connection, path, include_genres=False):
-    """Flatten labels per pack; pack descriptions are not label definitions."""
+    """Flatten JSON-array or normalized marketplace labels; descriptions are not definitions."""
     counts, row_count = Counter(), 0
-    for row_count, (raw,) in enumerate(connection.execute('SELECT tags FROM packs'), 1):
-        try:
-            values = json.loads(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f'Invalid JSON in packs.tags at row {row_count}.') from exc
-        if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
-            raise ValueError(f'packs.tags row {row_count} must contain a JSON list of strings.')
-        # A repeated label within one listing contributes one occurrence.
-        counts.update({value.strip() for value in values if value.strip()})
+    tables = {r[0] for r in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    normalized = False
+    if 'pack_tags' in tables:
+        columns = {r[1] for r in connection.execute('PRAGMA table_info(pack_tags)')}
+        normalized = {'pack_id', 'tag'} <= columns
+    if normalized:
+        for row_count, (value,) in enumerate(connection.execute('SELECT tag FROM pack_tags'), 1):
+            if isinstance(value, str) and value.strip():
+                counts[value.strip()] += 1
+    else:
+        for row_count, (raw,) in enumerate(connection.execute('SELECT tags FROM packs'), 1):
+            try:
+                values = json.loads(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Invalid JSON in packs.tags at row {row_count}.') from exc
+            if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+                raise ValueError(f'packs.tags row {row_count} must contain a JSON list of strings.')
+            # A repeated label within one listing contributes one occurrence.
+            counts.update({value.strip() for value in values if value.strip()})
     allowed = {'tag', 'genre', 'subgenre'} if include_genres else {'tag'}
     labels, kind_counts = [], Counter()
     for identifier_, count in sorted(counts.items()):
@@ -56,9 +67,10 @@ def read_marketplace_labels(connection, path, include_genres=False):
                          definition_source='User clarified that Rock means rock music.')
         labels.append(label)
     if not labels:
-        raise ValueError('No tag.* labels were found in packs.tags for the chosen scope.')
-    source = dict(file=path.name, table='packs', tag_column='tags', description_column=None,
-                  format='minecraft_packs_json_arrays', rows_read=row_count,
+        raise ValueError('No tag.* labels were found in the marketplace label table for the chosen scope.')
+    source = dict(file=path.name, table='pack_tags' if normalized else 'packs',
+                  tag_column='tag' if normalized else 'tags', description_column=None,
+                  format='minecraft_pack_tags_rows' if normalized else 'minecraft_packs_json_arrays', rows_read=row_count,
                   available_label_counts=dict(kind_counts), imported_label_count=len(labels),
                   include_genres=include_genres, skipped_other_values=kind_counts['other'],
                   notes=['Pack/world-type markers are excluded from semantic matching.',
@@ -87,6 +99,12 @@ def read_tags(path, table=None, tag_column=None, description_column=None, includ
             if 'tags' in pack_columns and 'pack_id' in pack_columns:
                 if description_column not in (None, '-'):
                     raise ValueError('packs.description describes products, not label meanings. Skip the description column for this format.')
+                return read_marketplace_labels(connection, path, include_genres)
+        if table is None and tag_column is None and 'pack_tags' in tables:
+            tag_columns = {r[1] for r in connection.execute('PRAGMA table_info(pack_tags)')}
+            if {'pack_id', 'tag'} <= tag_columns:
+                if description_column not in (None, '-'):
+                    raise ValueError('Marketplace pack descriptions are not tag definitions. Skip the description column for this format.')
                 return read_marketplace_labels(connection, path, include_genres)
         table = choose(tables, table, "Which table contains the Minecraft tags?")
         columns = [r[1] for r in connection.execute(f"PRAGMA table_info({identifier(table)})")]

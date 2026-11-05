@@ -2,6 +2,7 @@
 """Compare Roblox item text with tags imported from an existing database."""
 import argparse
 import csv
+from collections import Counter
 from datetime import datetime, timezone
 import html
 import json
@@ -18,6 +19,10 @@ from tag_database import read_tags
 ROOT = Path(__file__).resolve().parent
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+STOPWORDS = {"the", "and", "for", "with", "from", "roblox", "new", "free", "pack", "set",
+             "item", "items", "your", "you", "this", "that", "are", "made", "by", "of",
+             "in", "on", "to", "thanks", "purchasing", "purchase", "official"}
 
 
 def clean(value):
@@ -51,6 +56,112 @@ def matches(scores, tags, threshold):
         return result
     return ([candidate(i) for i in order if float(scores[i]) >= threshold],
             [candidate(i) for i in order[:3]])
+
+
+def rescue_by_name(model, rows, valid, tag_vectors, tags, threshold):
+    """Retry unmatched items using only their names to avoid generic descriptions."""
+    todo = [i for i in valid if not rows[i]["matches"]]
+    names = [clean(rows[i].get("name")) for i in todo]
+    keep = [k for k, name in enumerate(names) if name]
+    if not keep:
+        return 0
+    vectors = model.encode([names[k] for k in keep], normalize_embeddings=True,
+                           batch_size=64, show_progress_bar=False)
+    scores = vectors @ tag_vectors.T
+    found = 0
+    for local, k in enumerate(keep):
+        row = rows[todo[k]]
+        found_matches, _ = matches(scores[local], tags, threshold)
+        if found_matches:
+            for match in found_matches:
+                match["method"] = "name_only"
+            row["matches"] = found_matches
+            row["match_method"] = "name_only"
+            row["tag_status"] = "needs_review"
+            found += 1
+    return found
+
+
+def rescue_by_neighbors(rows, valid, embeddings, k=7, min_similarity=0.45, min_vote=0.6):
+    """Assign by weighted votes from the nearest original embedding matches only."""
+    import numpy as np
+
+    position = {row_index: p for p, row_index in enumerate(valid)}
+    voters = [i for i in valid if rows[i].get("match_method") == "embedding"]
+    todo = [i for i in valid if not rows[i]["matches"]]
+    if not voters or not todo:
+        return 0
+    voter_vectors = embeddings[[position[i] for i in voters]]
+    voter_labels = [(rows[i]["matches"][0]["tag"],
+                     rows[i]["matches"][0].get("kind", "tag")) for i in voters]
+    sample_entry = {}
+    for i, label in zip(voters, voter_labels):
+        sample_entry.setdefault(label, rows[i]["matches"][0])
+    k = min(k, len(voters))
+    found = 0
+    for start in range(0, len(todo), 256):
+        chunk = todo[start:start + 256]
+        similarities = embeddings[[position[i] for i in chunk]] @ voter_vectors.T
+        for local, row_index in enumerate(chunk):
+            nearest = np.argsort(similarities[local])[-k:]
+            neighbor_scores = similarities[local][nearest]
+            votes = {}
+            for neighbor, similarity in zip(nearest, neighbor_scores):
+                label = voter_labels[neighbor]
+                votes[label] = votes.get(label, 0.0) + max(float(similarity), 0.0)
+            total = sum(votes.values())
+            if total <= 0:
+                continue
+            winner = max(votes, key=votes.get)
+            vote_share = votes[winner] / total
+            mean_similarity = float(neighbor_scores.mean())
+            if vote_share >= min_vote and mean_similarity >= min_similarity:
+                entry = {key: value for key, value in sample_entry[winner].items()
+                         if key in ("tag", "tag_id", "kind")}
+                entry.update(similarity=round(mean_similarity, 5),
+                             vote_share=round(vote_share, 3), method="neighbors")
+                rows[row_index]["matches"] = [entry]
+                rows[row_index]["match_method"] = "neighbors"
+                rows[row_index]["tag_status"] = "needs_review"
+                found += 1
+    return found
+
+
+def propose_groups(rows, valid, embeddings, output):
+    """Cluster unresolved items for review and write representative words/examples."""
+    import numpy as np
+    from sklearn.cluster import KMeans
+
+    leftovers = [i for i in valid if not rows[i]["matches"]]
+    report = []
+    if len(leftovers) >= 20:
+        position = {row_index: p for p, row_index in enumerate(valid)}
+        vectors = embeddings[[position[i] for i in leftovers]]
+        group_count = max(2, min(20, len(leftovers) // 15))
+        estimator = KMeans(n_clusters=group_count, n_init=10, random_state=42)
+        labels = estimator.fit_predict(vectors)
+        for group in range(group_count):
+            member_positions = [j for j, label in enumerate(labels) if label == group]
+            if not member_positions:
+                continue
+            members = [leftovers[j] for j in member_positions]
+            distances = np.linalg.norm(vectors[member_positions] - estimator.cluster_centers_[group], axis=1)
+            examples = [members[j] for j in np.argsort(distances)[:6]]
+            words = Counter(word for i in members
+                            for word in set(re.findall(r"[a-z][a-z'\\-]{2,}",
+                                                       clean(rows[i].get("name")).lower()))
+                            if word not in STOPWORDS)
+            for i in members:
+                rows[i]["proposed_group"] = group + 1
+            report.append(dict(group=group + 1, size=len(members),
+                               common_words=", ".join(word for word, _ in words.most_common(6)),
+                               example_items=" | ".join(clean(rows[i].get("name")) for i in examples)))
+    report.sort(key=lambda row: row["size"], reverse=True)
+    with (output / "proposed_groups.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["group", "size", "common_words", "example_items"])
+        writer.writeheader()
+        writer.writerows(report)
+    return len(report)
 
 
 def favorites(row):
@@ -103,6 +214,8 @@ def make_map(rows, coords, metadata, destination):
                          f"<b>{safe(row.get('name') or '(no name)')}</b><br>Favorites: unknown<br>")
             hover[-1] += (f"Suggested tags: {safe(', '.join(display_match(c) for c in row['matches']) or 'Unclassified')}<br>"
                           f"Closest candidates: {safe(candidate_text)}<br>"
+                          f"Match method: {safe(row.get('match_method') or 'none')}<br>"
+                          f"Proposed review group: {safe(row.get('proposed_group') or 'none')}<br>"
                           f"{safe(clean(row.get('description'))[:240])}")
             if row.get('bestselling_rank') is not None:
                 hover[-1] += (f"<br>Bestselling position: {safe(row['bestselling_rank'])} "
@@ -120,6 +233,7 @@ def make_map(rows, coords, metadata, destination):
     chart = fig.to_html(full_html=False, include_plotlyjs=True,
                         config={"responsive": True, "displaylogo": False})
     note = html.escape(metadata.get("note", ""))
+    rescue = metadata.get("rescue", {})
     page = f"""<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Roblox tag explorer</title>
 <style>body{{font:16px system-ui,sans-serif;color:#182338;margin:0;background:#f7f9fc}}
@@ -131,6 +245,9 @@ p{{line-height:1.6;max-width:1000px}}.small{{color:#536174;font-size:14px}}
 <p>{metadata['item_count']:,} items compared with {metadata['tag_count']:,} imported tags.
 Showing {len(rows):,} items in this map. {metadata['matched_item_count']:,} items have a suggested tag
 at similarity ≥ {metadata['threshold']:.2f}.</p>
+<p class="small">Extra review-only suggestions: {rescue.get('by_name', 0):,} matched by name alone,
+{rescue.get('by_neighbors', 0):,} by neighbors. {rescue.get('unclassified_after', 0):,} items remain unmatched.
+Unmatched items may also have proposed groups in proposed_groups.csv.</p>
 <p class="small">{note}</p><div class="chart">{chart}</div>
 <p><b>Drag to rotate · Scroll to zoom · Hover to inspect · Click a legend label to hide it.</b></p>
 <p class="small">Position approximates text meaning ({html.escape(metadata['projection'])}).
@@ -151,7 +268,8 @@ def csv_safe(value):
     return value
 
 
-def analyze(items, tags, output, threshold=0.35, note="", tag_source=None):
+def analyze(items, tags, output, threshold=0.35, note="", tag_source=None,
+            rescue=True, knn_k=7, knn_min_similarity=0.45, knn_min_vote=0.6):
     import numpy as np
     from sentence_transformers import SentenceTransformer
     output.mkdir(parents=True, exist_ok=False)
@@ -178,6 +296,23 @@ def analyze(items, tags, output, threshold=0.35, note="", tag_source=None):
             row = rows[valid[start + offset]]
             row["matches"], row["top_candidates"] = matches(score, tags, threshold)
             row["tag_status"] = "needs_review" if row["matches"] else "unclassified"
+    for row in rows:
+        row["match_method"] = "embedding" if row["matches"] else None
+        row["proposed_group"] = None
+    unclassified_before = sum(row["tag_status"] == "unclassified" for row in rows)
+    rescue_summary = dict(by_name=0, by_neighbors=0, proposed_groups=0,
+                          unclassified_before=unclassified_before)
+    if rescue:
+        print("Rescuing unmatched items (name-only match, then neighbor vote)...", flush=True)
+        rescue_summary["by_name"] = rescue_by_name(model, rows, valid, tag_vectors, tags, threshold)
+        rescue_summary["by_neighbors"] = rescue_by_neighbors(
+            rows, valid, embeddings, k=knn_k, min_similarity=knn_min_similarity,
+            min_vote=knn_min_vote)
+        rescue_summary["proposed_groups"] = propose_groups(rows, valid, embeddings, output)
+    rescue_summary["unclassified_after"] = sum(row["tag_status"] == "unclassified" for row in rows)
+    print(f"Unclassified items: {rescue_summary['unclassified_before']:,} -> "
+          f"{rescue_summary['unclassified_after']:,} (name-only: +{rescue_summary['by_name']:,}, "
+          f"neighbors: +{rescue_summary['by_neighbors']:,}).", flush=True)
     selected = np.sort(np.random.default_rng(42).choice(len(valid), min(5000, len(valid)), replace=False))
     print("Making the 3D map...", flush=True)
     coords, method = project(embeddings[selected])
@@ -188,6 +323,11 @@ def analyze(items, tags, output, threshold=0.35, note="", tag_source=None):
                     model_revision=MODEL_REVISION,
                     item_count=len(items), tag_count=len(tags), tag_source=tag_source,
                     matched_item_count=sum(bool(r["matches"]) for r in rows),
+                    embedding_matched_item_count=sum(r["match_method"] == "embedding" for r in rows),
+                    rescue=rescue_summary,
+                    rescue_settings=dict(enabled=rescue, knn_k=knn_k,
+                                         knn_min_similarity=knn_min_similarity,
+                                         knn_min_vote=knn_min_vote),
                     threshold=threshold, projection=method, map_item_count=len(map_rows),
                     map_limit=5000, random_seed=42, note=note,
                     matching="Cosine similarity of normalized text embeddings; multiple tags or none.",
@@ -201,7 +341,8 @@ def analyze(items, tags, output, threshold=0.35, note="", tag_source=None):
     original_fields = list(dict.fromkeys(key for row in items for key, value in row.items()
                            if value is None or isinstance(value, (str, int, float, bool))))
     added = ['suggested_tags', 'suggested_genres', 'suggested_subgenres', 'tag_status',
-             'closest_tag', 'closest_similarity', 'closest_tag_id', 'all_matches', 'all_search_rankings']
+             'closest_tag', 'closest_similarity', 'closest_tag_id', 'all_matches', 'all_search_rankings',
+             'match_method', 'proposed_group']
     fields = [key for key in original_fields if key not in added] + added
     with (output / "matches.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -214,6 +355,7 @@ def analyze(items, tags, output, threshold=0.35, note="", tag_source=None):
                           suggested_subgenres="; ".join(m['tag'] for m in row['matches'] if m.get('kind')=='subgenre'),
                           closest_tag=top.get("tag"), closest_similarity=top.get("similarity"),
                           closest_tag_id=top.get('tag_id'),
+                          match_method=row.get('match_method'), proposed_group=row.get('proposed_group'),
                           all_search_rankings=json.dumps(row.get('rankings',[]),ensure_ascii=False),
                           all_matches=json.dumps(row["matches"], ensure_ascii=False))
             writer.writerow({key: csv_safe(value) for key, value in values.items()})
@@ -248,23 +390,39 @@ def main():
     parser.add_argument('--include-genres', action='store_true', help='Also match genre.* and subgenre.* labels from packs.tags')
     parser.add_argument('--note', default='', help='Optional context displayed in the map and analysis metadata')
     parser.add_argument("--threshold", type=float, default=0.35)
+    parser.add_argument('--no-rescue', action='store_true',
+                        help='Skip name-only matching, neighbor voting, and leftover grouping')
+    parser.add_argument('--knn-k', type=int, default=7, help='Number of original matches that vote')
+    parser.add_argument('--knn-min-similarity', type=float, default=0.45,
+                        help='Minimum average cosine similarity to voting neighbors')
+    parser.add_argument('--knn-min-vote', type=float, default=0.60,
+                        help='Minimum winning share of weighted neighbor votes')
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not math.isfinite(args.threshold) or not -1 <= args.threshold <= 1:
         parser.error("--threshold must be a number between -1 and 1.")
+    if args.knn_k < 1:
+        parser.error('--knn-k must be at least 1.')
+    if (not math.isfinite(args.knn_min_similarity) or not -1 <= args.knn_min_similarity <= 1 or
+            not math.isfinite(args.knn_min_vote) or not 0 <= args.knn_min_vote <= 1):
+        parser.error('--knn-min-similarity must be between -1 and 1; --knn-min-vote between 0 and 1.')
     snapshot = args.snapshot or input_path("Drag your Roblox snapshot.json here, then press Enter: ")
     database = args.database or input_path("Drag your Minecraft tag database here, then press Enter: ")
     items = read_items(snapshot)
     tags, source = read_tags(database, args.table, args.tag_column, args.description_column, args.include_genres)
-    if source.get('format') == 'minecraft_packs_json_arrays':
-        print(f"Detected Minecraft database: {source['rows_read']:,} listings; using "
+    source_format = source.get('format')
+    if source_format in ('minecraft_packs_json_arrays', 'minecraft_pack_tags_rows'):
+        row_kind = 'listings' if source_format == 'minecraft_packs_json_arrays' else 'pack-tag rows'
+        print(f"Detected Minecraft database: {source['rows_read']:,} {row_kind}; using "
               + ('labels, genres and subgenres.' if args.include_genres else 'labels only.'))
     print(f"Imported {len(tags):,} distinct tags. First few: " + ", ".join(t["name"] for t in tags[:12]))
     undefined = sum(not t['description'] for t in tags)
     if undefined:
         print(f'{undefined:,} labels have no definitions. Suggestions based on names alone need review.')
     output = args.output or ROOT / "results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    analyze(items, tags, output, args.threshold, note=args.note, tag_source=source)
+    analyze(items, tags, output, args.threshold, note=args.note, tag_source=source,
+            rescue=not args.no_rescue, knn_k=args.knn_k,
+            knn_min_similarity=args.knn_min_similarity, knn_min_vote=args.knn_min_vote)
 
 
 if __name__ == "__main__":
